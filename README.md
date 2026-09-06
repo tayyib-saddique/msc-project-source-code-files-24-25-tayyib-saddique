@@ -52,4 +52,7 @@ research artefacts.
 
 The project uses the USC X 24 US Election dataset. Follow its licensing and
 citation requirements when using or redistributing derived results:
-https://github.com/sinking8/usc-x-24-us-election
+https://github.com/sinking8/usc-x-24-us-election. 
+
+Data from the USC X 24 US Election dataset (CC BY-NC-SA 4.0). 
+Cite: Balasubramanian et al., arXiv:2411.00376.
