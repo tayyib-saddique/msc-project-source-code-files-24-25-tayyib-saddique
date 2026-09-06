@@ -1,19 +1,11 @@
 import os
-import re
 import time
 import logging
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import Counter
 
 import numpy as np
 import pandas as pd
-import emoji
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-from nltk.tokenize import word_tokenize
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 import torch
 import torch.nn as nn
@@ -29,19 +21,21 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 import joblib
 
-# --- NLTK downloads (quiet) ---
-nltk.download("stopwords", quiet=True)
-nltk.download("punkt", quiet=True)
-nltk.download("wordnet", quiet=True)
-
-# --- Logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from x_processing.config import (
+    EXPERIMENT_MODEL_DIR,
+    LABELLED_PARQUET,
+    RAW_DATA_DIR,
+    UNLABELLED_PARQUET,
+)
+from x_processing.preprocessing import (
+    download_nltk_resources,
+    find_input_files,
+    load_preprocess_weak_label,
+)
 
 # --- Globals / Configuration (adapt to environment) ---
-MODEL_DIR = Path("x_processing/models/experiments")
-LABELLED_PARQUET = Path("x_processing/train_labelled.parquet")
-UNLABELLED_PARQUET = Path("x_processing/train_unlabelled.parquet")
-INPUT_DIR = Path(__file__).resolve().parents[1] / "x-24-us-election"  # adapt if needed
+MODEL_DIR = EXPERIMENT_MODEL_DIR
+INPUT_DIR = RAW_DATA_DIR
 N_JOBS = os.cpu_count() or 4
 
 # Embedding / model defaults
@@ -52,111 +46,6 @@ MLP_HIDDEN_DIM = 256
 MLP_MAX_EPOCHS = 8             # adjust up for final training
 MLP_LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Weak labeling constants
-lemmatizer = WordNetLemmatizer()
-stop_words = set(stopwords.words("english"))
-vader = SentimentIntensityAnalyzer()
-
-CANDIDATE_KEYWORDS = {
-    "democrat": ["#bidenharris2024", "#kamalaharris2024", "@joebiden", "@kamalaharris", "democrats", "biden"],
-    "republican": ["#maga", "republican", "#trump2024", "@realdonaldtrump", "trump"]
-}
-STRONG_SENTIMENT_THRESHOLD = 0.8
-CAMPAIGN_START_DATE = pd.Timestamp("2024-05-01") 
-
-# Ensure model dir exists
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-# Helper functions
-def convert_to_timestamp(df):
-    """Create 'timestamp' column from date/epoch, coerce errors."""
-    df['timestamp'] = pd.to_datetime(df['date'], errors='coerce')
-    missing_date_mask = df['timestamp'].isna() & df['epoch'].notna()
-    df.loc[missing_date_mask, 'timestamp'] = pd.to_datetime(df.loc[missing_date_mask, 'epoch'], unit='s')
-    return df
-
-def filter_campaign_tweets(df):
-    """Keep only tweets after May 1, 2024."""
-    df = convert_to_timestamp(df)
-    return df[df['timestamp'] >= CAMPAIGN_START_DATE]
-
-# Preprocessing & Weak-label functions
-def preprocess(text: str) -> str:
-    """Lowercase, demojize, remove URLs/mentions, basic tokenization + lemmatization + stopword removal."""
-    text = (text or "").lower()
-    text = emoji.demojize(text, delimiters=(" ", " "))
-    text = re.sub(r"http\S+|www\S+|https\S+|@\w+", " ", text)
-    text = re.sub(r"[^a-z0-9\s#']", " ", text)
-    tokens = word_tokenize(text)
-    tokens = [lemmatizer.lemmatize(t) for t in tokens if t not in stop_words and len(t) > 1]
-    return " ".join(tokens)
-
-
-def detect_candidate(text: str):
-    t = (text or "").lower()
-    for candidate, keywords in CANDIDATE_KEYWORDS.items():
-        if any(k in t for k in keywords):
-            return candidate
-    return None
-
-
-def label_sentiment(text: str):
-    score = vader.polarity_scores(text or "")["compound"]
-    if score >= STRONG_SENTIMENT_THRESHOLD:
-        return "positive"
-    if score <= -STRONG_SENTIMENT_THRESHOLD:
-        return "negative"
-    return None
-
-
-def load_preprocess_weak_label(file_path):
-    try:
-        df = pd.read_csv(
-            file_path,
-            compression="gzip",
-            usecols=["id", "rawContent", "lang", "date", "epoch"],
-            dtype={"id": str, "rawContent": str, "lang": str, "date": str, "epoch": object}
-        )
-        df = df[df["lang"] == "en"]
-        if df.empty:
-            return None, None
-
-        df = filter_campaign_tweets(df)
-        if df.empty:
-            return None, None
-
-        df = df.rename(columns={"rawContent": "text"})
-        df['clean_text'] = df['text'].apply(preprocess)
-        df['party'] = df['text'].apply(detect_candidate)
-        df['sentiment_score'] = df['text'].apply(lambda t: vader.polarity_scores(t)['compound'])
-        df['sentiment'] = df['sentiment_score'].apply(
-            lambda score: 'positive' if score >= STRONG_SENTIMENT_THRESHOLD else 'negative'
-            if score <= -STRONG_SENTIMENT_THRESHOLD else None
-        )
-
-        labelled = df.dropna(subset=['party', 'sentiment'])
-        unlabelled = df[df['party'].isna() | df['sentiment'].isna()]
-
-        if labelled.empty and unlabelled.empty:
-            return None, None
-
-        return (
-            labelled[['clean_text', 'date', 'party', 'sentiment', 'sentiment_score']],
-            unlabelled[['id', 'clean_text', 'text', 'date']]
-        )
-    except Exception as e:
-        print(f"Error processing {file_path}: {e}")
-        return None, None
-
-
-def find_all_files_recursively(directory: Path, extension: str = ".csv.gz"):
-    files = []
-    for root, _, filenames in os.walk(directory):
-        for filename in filenames:
-            if filename.endswith(extension):
-                files.append(os.path.join(root, filename))
-    return files
 
 # ------------------------
 # Embeddings & PyTorch MLP (skorch wrapper)
@@ -298,7 +187,10 @@ def train_and_save_model(X, y, task_name: str, model_dir: Path = MODEL_DIR,
     y_enc = le.fit_transform(y)
 
     # train/test
-    X_train, X_test, y_train, y_test = safe_train_test_split(X, y_enc, stratify=y_enc if len(np.unique(y_enc)) > 1 else None)
+    stratify = y_enc if len(np.unique(y_enc)) > 1 else None
+    X_train, X_test, y_train, y_test = safe_train_test_split(
+        X, y_enc, stratify=stratify
+    )
 
     pipeline = build_embedding_mlp_pipeline(input_dim=input_dim, n_classes=len(le.classes_),
                                             pca_components=pca_components, batch_size=batch_size,
@@ -328,9 +220,14 @@ def train_and_save_model(X, y, task_name: str, model_dir: Path = MODEL_DIR,
 # Top-level main
 # ------------------------
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
     total_start = time.time()
     logging.info("Starting pipeline (device=%s)", DEVICE)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    download_nltk_resources()
 
     # 1) Load or preprocess & create labelled parquet
     if LABELLED_PARQUET.exists():
@@ -340,7 +237,7 @@ def main():
     else:
         # find files and process in parallel
         logging.info("Labelled parquet not found, searching INPUT_DIR=%s for csv.gz files", INPUT_DIR)
-        files = find_all_files_recursively(INPUT_DIR, extension=".csv.gz")
+        files = find_input_files(INPUT_DIR, extension=".csv.gz")
         logging.info("Found %d compressed files to process", len(files))
         labelled_dfs = []
         unlabelled_dfs = []

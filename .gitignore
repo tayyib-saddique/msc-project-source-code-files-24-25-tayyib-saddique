@@ -1,11 +1,16 @@
-# adding in large parquets
+# Generated datasets
 x_processing/*.parquet
 
-# adding in models
-x_processing/models/*.joblib
-x_processing/models/experiments/*.joblib
-x_processing/models/experiments/fine_tuned/*.joblib
+# Trained models
+x_processing/models/**/*.joblib
 
-# adding in cache 
+# Python and notebook caches
 .ipynb_checkpoints/
 __pycache__/
+*.py[cod]
+
+# Local environments and tooling
+.venv/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

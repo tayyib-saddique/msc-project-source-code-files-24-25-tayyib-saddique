@@ -1,0 +1,3 @@
+[submodule "x-24-us-election"]
+	path = x-24-us-election
+	url = https://github.com/sinking8/usc-x-24-us-election.git

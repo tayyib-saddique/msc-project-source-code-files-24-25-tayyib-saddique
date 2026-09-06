@@ -1,15 +1,7 @@
 import os
-import re
 import time
-import numpy as np
 import pandas as pd
 from collections import Counter
-import emoji
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-from nltk.tokenize import word_tokenize
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -27,113 +19,23 @@ import lightgbm as lgb
 import joblib
 import torch
 
-# NLTK setup
-nltk.download('stopwords', quiet=True)
-nltk.download('punkt', quiet=True)
-nltk.download('wordnet', quiet=True)
-lemmatizer = WordNetLemmatizer()
-stop_words = set(stopwords.words('english'))
-vader = SentimentIntensityAnalyzer()
-
-# Constants
-CANDIDATE_KEYWORDS = {
-    'democrat': ['#bidenharris2024', '#kamalaharris2024', '@joebiden', '@kamalaharris', 'democrats'],
-    'republican': ['#maga', 'republican', '#trump2024', '@realdonaldtrump']
-}
-STRONG_SENTIMENT_THRESHOLD = 0.8
-# some tweets are dated prior to 05 May 2024
-CAMPAIGN_START_DATE = pd.Timestamp("2024-05-01") 
-
-MODEL_DIR = "x_processing/models/experiments"
-labelled_parquet = "x_processing/train_labelled.parquet"
-unlabelled_parquet = "x_processing/train_unlabelled.parquet"
-
-# Helper functions
-def convert_to_timestamp(df):
-    """Create 'timestamp' column from date/epoch, coerce errors."""
-    df['timestamp'] = pd.to_datetime(df['date'], errors='coerce')
-    missing_date_mask = df['timestamp'].isna() & df['epoch'].notna()
-    df.loc[missing_date_mask, 'timestamp'] = pd.to_datetime(df.loc[missing_date_mask, 'epoch'], unit='s')
-    return df
-
-def filter_campaign_tweets(df):
-    """Keep only tweets after May 1, 2024."""
-    df = convert_to_timestamp(df)
-    return df[df['timestamp'] >= CAMPAIGN_START_DATE]
-
-# Preprocessing & Weak labeling
-def preprocess(text):
-    text = text.lower()
-    text = emoji.demojize(text, delimiters=(" ", " "))
-    text = re.sub(r"http\S+|www\S+|https\S+|@\w+", "", text)
-    text = re.sub(r"[^a-z0-9\s#']", " ", text)
-    tokens = word_tokenize(text)
-    tokens = [lemmatizer.lemmatize(t) for t in tokens if t not in stop_words and len(t) > 1]
-    return " ".join(tokens)
-
-def detect_candidate(text):
-    text = text.lower()
-    for candidate, keywords in CANDIDATE_KEYWORDS.items():
-        if any(k in text for k in keywords):
-            return candidate
-    return None
-
-def label_sentiment(text):
-    score = vader.polarity_scores(text)['compound']
-    if score >= STRONG_SENTIMENT_THRESHOLD:
-        return 'positive'
-    elif score <= -STRONG_SENTIMENT_THRESHOLD:
-        return 'negative'
-    else:
-        return None
-
-def load_preprocess_weak_label(file_path):
-    try:
-        df = pd.read_csv(
-            file_path,
-            compression="gzip",
-            usecols=["id", "rawContent", "lang", "date", "epoch"],
-            dtype={"id": str, "rawContent": str, "lang": str, "date": str, "epoch": object}
-        )
-        df = df[df["lang"] == "en"]
-        if df.empty:
-            return None, None
-
-        df = filter_campaign_tweets(df)
-        if df.empty:
-            return None, None
-
-        df = df.rename(columns={"rawContent": "text"})
-        df['clean_text'] = df['text'].apply(preprocess)
-        df['party'] = df['text'].apply(detect_candidate)
-        df['sentiment_score'] = df['text'].apply(lambda t: vader.polarity_scores(t)['compound'])
-        df['sentiment'] = df['sentiment_score'].apply(
-            lambda score: 'positive' if score >= STRONG_SENTIMENT_THRESHOLD else 'negative'
-            if score <= -STRONG_SENTIMENT_THRESHOLD else None
-        )
-
-        labelled = df.dropna(subset=['party', 'sentiment'])
-        unlabelled = df[df['party'].isna() | df['sentiment'].isna()]
-
-        if labelled.empty and unlabelled.empty:
-            return None, None
-
-        return (
-            labelled[['clean_text', 'date', 'party', 'sentiment', 'sentiment_score']],
-            unlabelled[['id', 'clean_text', 'text', 'date']]
-        )
-    except Exception as e:
-        print(f"Error processing {file_path}: {e}")
-        return None, None
+from x_processing.config import (
+    EXPERIMENT_MODEL_DIR,
+    LABELLED_PARQUET,
+    RAW_DATA_DIR,
+    UNLABELLED_PARQUET,
+)
+from x_processing.preprocessing import (
+    download_nltk_resources,
+    find_input_files,
+    load_preprocess_weak_label,
+)
 
 
-def find_all_files_recursively(directory, extension=".csv.gz"):
-    files = []
-    for root, _, filenames in os.walk(directory):
-        for filename in filenames:
-            if filename.endswith(extension):
-                files.append(os.path.join(root, filename))
-    return files
+MODEL_DIR = str(EXPERIMENT_MODEL_DIR)
+labelled_parquet = str(LABELLED_PARQUET)
+unlabelled_parquet = str(UNLABELLED_PARQUET)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 #  Evaluation 
 def evaluate_model(pipeline, X_test, y_test, model_name, output_path=None):
@@ -154,16 +56,8 @@ def evaluate_model(pipeline, X_test, y_test, model_name, output_path=None):
     return acc
 
 #  Transformers 
-def vader_sentiment_features(X):
-    """ Returns a NumPy array with 4 columns: neg, neu, pos, compound scores. """
-    features = []
-    for t in X:
-        scores = vader.polarity_scores(t)
-        features.append([scores['neg'], scores['neu'], scores['pos'], scores['compound']])
-    return np.array(features)
-
 class EmbeddingTransformer(BaseEstimator, TransformerMixin):
-    def __init__(self, model_name="all-MiniLM-L6-v2", batch_size=256, device='cuda:0'):
+    def __init__(self, model_name="all-MiniLM-L6-v2", batch_size=256, device=DEVICE):
         self.model_name = model_name
         self.batch_size = batch_size
         self.device = device
@@ -290,6 +184,7 @@ def train_and_save_top_models(X, y, model_candidates, task_name, feature_mode='t
 #  Main 
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
+    download_nltk_resources()
     total_start = time.time()
 
     # Load or preprocess data
@@ -300,12 +195,11 @@ def main():
         print(f"Total rows in labelled data is {len(labelled_df)}")
     else:
         print("Preprocessing raw data...")
-        INPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "x-24-us-election"))
-        all_files = find_all_files_recursively(INPUT_DIR)
+        all_files = find_input_files(RAW_DATA_DIR)
         print(f"Found {len(all_files)} files")
 
         labelled_dfs, unlabelled_dfs = [], []
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        with ProcessPoolExecutor(max_workers=os.cpu_count() or 1) as executor:
             futures = {executor.submit(load_preprocess_weak_label, file): file for file in all_files}
             for i, future in enumerate(as_completed(futures)):
                 file = futures[future]
